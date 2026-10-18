@@ -93,7 +93,7 @@ class ExperienceConfig(BaseModel):
 class SleepConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
     idle_seconds: float = Field(default=15, ge=0)
     step_delay_seconds: float = Field(default=30, ge=0)
     # None means continuous reflection while idle, without a call/step quota.

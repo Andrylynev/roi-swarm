@@ -419,7 +419,7 @@ path = Path(__import__("sys").argv[1])
 values = dict(dotenv_values(path, interpolate=False)) if path.exists() else {}
 for name in ("ROI_PROVIDER_BASE_URL", "ROI_PROVIDER_API_KEY", "ROI_SWARM_API_KEY", "ROI_HOST", "ROI_PORT"):
     values[name] = os.environ[name]
-values.setdefault("ROI_SLEEP_ENABLED", "false")
+values.setdefault("ROI_SLEEP_ENABLED", "true")
 values.setdefault("ROI_SLEEP_AUTO_IMPROVE", "false")
 fd, temporary = tempfile.mkstemp(prefix=".env-", dir=path.parent)
 try:

@@ -211,6 +211,10 @@ def verify_install(
     assert actual_roles == expected_roles, actual_roles
     saved = json.loads((INSTALL / "data/model-settings.json").read_text(encoding="utf-8"))
     assert saved["roles"] == expected_roles, saved
+    sleep = json.loads(request(base + "/api/sleep", token))
+    assert sleep["enabled"] is True, sleep
+    assert sleep["auto_improve"] is False, sleep
+    assert sleep["daily_calls"] == 0, "Fresh idle installation must not infer without a source run"
 
     before = provider.successful_probes(provider_path + "/models")
     options = json.loads(request(base + "/api/model-options", token))
@@ -267,7 +271,7 @@ def verify_install(
         "ROI_SWARM_API_KEY": token,
         "ROI_HOST": "127.0.0.1",
         "ROI_PORT": str(port),
-        "ROI_SLEEP_ENABLED": "false",
+        "ROI_SLEEP_ENABLED": "true",
         "ROI_SLEEP_AUTO_IMPROVE": "false",
     }
     if custom:

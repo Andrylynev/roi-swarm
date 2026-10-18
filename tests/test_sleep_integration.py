@@ -7,10 +7,29 @@ from roi_swarm.config import SleepConfig
 pytest_plugins = ("test_project_isolation",)
 
 
-def test_sleep_defaults_are_unlimited_and_optional():
-    assert SleepConfig().enabled is False
+def test_sleep_defaults_are_enabled_and_unlimited_without_auto_improve():
+    assert SleepConfig().enabled is True
+    assert SleepConfig().auto_improve is False
     assert SleepConfig().daily_call_limit is None
     assert SleepConfig().max_steps_per_cycle is None
+
+
+async def test_default_enabled_runner_preserves_saved_opt_out_on_restart(scoped_runner):
+    from roi_swarm.runner import SwarmRunner
+
+    await scoped_runner.start()
+    assert scoped_runner.sleep_status()["enabled"] is True
+    assert scoped_runner.sleep_status()["daily_calls"] == 0
+    await scoped_runner.set_sleep_enabled(False)
+    await scoped_runner.close()
+    restored = SwarmRunner(scoped_runner.config_path)
+    try:
+        await restored.start()
+        assert restored.settings.sleep.enabled is True
+        assert restored.sleep_status()["enabled"] is False
+        assert restored.sleep_status()["daily_calls"] == 0
+    finally:
+        await restored.close()
 
 
 @pytest.mark.parametrize("method", ["run", "respond_with_tools"])

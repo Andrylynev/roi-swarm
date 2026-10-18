@@ -73,6 +73,31 @@ def test_provider_probe_sends_actual_key(provider):
     assert seen == [("/models", "Bearer fixture-key")]
 
 
+@pytest.mark.parametrize("saved", [None, "false", "true"])
+def test_installer_enables_new_sleep_but_preserves_saved_choice(tmp_path, provider, saved):
+    from dotenv import dotenv_values
+
+    url, _ = provider
+    env_file = tmp_path / ".env"
+    if saved is not None:
+        env_file.write_text(f"ROI_SLEEP_ENABLED={saved}\n", encoding="utf-8")
+    result = run_function(
+        "configure_models() { :; }; configure",
+        INSTALL_DIR=tmp_path.as_posix(),
+        NON_INTERACTIVE="true",
+        RECONFIGURE="false",
+        PROVIDER_URL=url,
+        PROVIDER_KEY="fixture-key",
+        SWARM_KEY="fixture-token",
+        HOST="127.0.0.1",
+        PORT="8765",
+    )
+    assert result.returncode == 0, result.stderr
+    values = dotenv_values(env_file)
+    assert values["ROI_SLEEP_ENABLED"] == ("true" if saved is None else saved)
+    assert values["ROI_SLEEP_AUTO_IMPROVE"] == "false"
+
+
 def test_reconfigure_preserves_unknown_env_and_quotes_values(tmp_path, provider):
     from dotenv import dotenv_values
 

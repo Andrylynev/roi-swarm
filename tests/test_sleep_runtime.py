@@ -10,7 +10,8 @@ def test_sleep_has_unlimited_default_budgets():
     config = SleepConfig()
     assert config.max_steps_per_cycle is None
     assert config.daily_call_limit is None
-    assert config.enabled is False
+    assert config.enabled is True
+    assert config.auto_improve is False
 
 
 class FakeSleep:

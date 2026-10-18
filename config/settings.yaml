@@ -80,9 +80,9 @@ experience:
   database_path: data/experience/experience.sqlite
   maximum_lessons: 6  # только подтверждённые рекомендации, не исходники проекта
 
-# Режим сна тратит запросы провайдера, пока рой простаивает: включается явно.
+# Режим сна включён по умолчанию и тратит запросы провайдера во время простоя.
 sleep:
-  enabled: ${ROI_SLEEP_ENABLED:-false}
+  enabled: ${ROI_SLEEP_ENABLED:-true}
   idle_seconds: 15
   step_delay_seconds: 30  # пауза между шагами, не лимит числа вызовов
   max_steps_per_cycle: null

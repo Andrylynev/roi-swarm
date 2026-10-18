@@ -21,7 +21,7 @@ def test_required_env_without_default_still_fails(monkeypatch):
         _expand_environment("${ROI_FIXTURE_REQUIRED}")
 
 
-def test_shipped_settings_are_cloud_only_and_quiet_by_default(monkeypatch):
+def test_shipped_settings_are_cloud_only_with_sleep_enabled_by_default(monkeypatch):
     from roi_swarm.runner import PROJECT_ROOT
     from roi_swarm.settings import load_settings
 
@@ -31,8 +31,19 @@ def test_shipped_settings_are_cloud_only_and_quiet_by_default(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     settings = load_settings(PROJECT_ROOT / "config" / "settings.yaml")
     assert settings.rag.embeddings_enabled is False
-    assert settings.sleep.enabled is False
+    assert settings.sleep.enabled is True
     assert settings.sleep.auto_improve is False
+
+
+def test_shipped_sleep_respects_explicit_disabled_environment(monkeypatch):
+    from roi_swarm.runner import PROJECT_ROOT
+    from roi_swarm.settings import load_settings
+
+    monkeypatch.setenv("ROI_PROVIDER_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("ROI_PROVIDER_API_KEY", "fixture-only")
+    monkeypatch.setenv("ROI_SLEEP_ENABLED", "false")
+    settings = load_settings(PROJECT_ROOT / "config" / "settings.yaml")
+    assert settings.sleep.enabled is False
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.10", "::"])
