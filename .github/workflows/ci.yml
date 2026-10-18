@@ -59,6 +59,9 @@ jobs:
           # sudo uses root's Git configuration, not checkout's runner-owned one.
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE/.git"
+      - name: Secure shared tool directory on this disposable runner
+        # Hosted runners allow group writes here; a client root install refuses that.
+        run: sudo chmod 755 /usr/local /usr/local/bin
       - name: Install, verify, update, reconfigure and uninstall
         # Only a loopback deterministic OpenAI fixture is used. No paid API calls.
         run: |
