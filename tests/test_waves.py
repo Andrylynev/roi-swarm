@@ -303,6 +303,25 @@ def test_project_folder_named_in_plan_overrides_hermes_cwd(tmp_path) -> None:
     assert opened == [str(project.resolve())]
 
 
+@pytest.mark.parametrize("candidate", ["/srv/my app", "\\srv\\my app"])
+def test_named_folder_scans_posix_absolute_paths(monkeypatch, candidate):
+    import roi_swarm.waves as module
+
+    def existing(text, *, files):
+        return "fixture-project" if text.replace("\\", "/") == "/srv/my app" else None
+
+    monkeypatch.setattr(module, "_existing_folder", existing)
+    assert module._named_folder(f"edit {candidate} then test") == "fixture-project"
+    for text in (
+        "see https://example.test/srv/my app",
+        "see https://example.test/releases-/srv/my app",
+        "see https://example.test/?path=/srv/my app",
+        "edit ./srv/my app then test",
+        "edit ../srv/my app then test",
+    ):
+        assert module._named_folder(text) is None
+
+
 def test_project_folder_falls_back_to_existing_path_in_request(tmp_path) -> None:
     from roi_swarm.waves import project_directory
 

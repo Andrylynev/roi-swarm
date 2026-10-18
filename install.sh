@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run_owned deliberately changes HOME/USER only in its privilege-drop subshell.
-# shellcheck disable=SC2030,SC2031
+# Guard chains intentionally fail if ANY predicate is false, not an if/else.
+# shellcheck disable=SC2015,SC2030,SC2031
 # ROI Swarm — установка одной командой:
 #
 #   curl -fsSL https://raw.githubusercontent.com/Andrylynev/roi-swarm/main/install.sh | bash

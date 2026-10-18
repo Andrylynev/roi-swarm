@@ -132,7 +132,7 @@ def render_transcript(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-_DRIVE_PATH = re.compile(r"(?<![\w])[A-Za-z]:[\\/]")
+_DRIVE_PATH = re.compile(r"(?<![\w])[A-Za-z]:[\\/]|(?:^|(?<=[\s\"'`(]))[\\/](?![\\/])")
 _PATH_TAIL = ".,;:!?)]}»\"'`"
 # Longest path prefix tried per match; bounds filesystem probes on long pasted lines.
 _PATH_SCAN_CHARS = 400
@@ -164,7 +164,8 @@ def _project_folder(candidate: str, *, files: bool = True) -> str | None:
 
 
 def _existing_folder(text: str, *, files: bool) -> str | None:
-    path = Path(text)
+    # Accept Windows-style separators in pasted POSIX paths as well.
+    path = Path(text if os.name == "nt" else text.replace("\\", "/"))
     if not path.is_absolute():
         return None
     try:
