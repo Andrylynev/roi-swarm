@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from openai import AsyncOpenAI
 
 from roi_swarm.agent_loop import WORK_TOOLS, AgentTurn, HermesToolAgent
 from roi_swarm.context import ContextPipeline
+from roi_swarm.conversation import current_task, is_runtime_notice
 from roi_swarm.embeddings import GraniteOnnxEmbedder
 from roi_swarm.experience import ExperienceStore, WorkflowLesson
 from roi_swarm.gateway import ModelGateway
@@ -57,6 +59,22 @@ def _hermes_python(root: str) -> str:
     return str(next((path for path in candidates if path.exists()), candidates[0]))
 
 
+@dataclass
+class _CoordinatorTurn:
+    runner: Any
+    logical_id: str
+    completion_id: str
+    project_id: str | None
+    claimed: bool = False
+    closed: bool = False
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.runner._coordinator_active.discard(self.logical_id)
+            self.runner._active_operations -= 1
+
+
 class SwarmRunner:
     """Resident runner: keeps the HTTP client and compiled graph warm between prompts."""
 
@@ -75,6 +93,7 @@ class SwarmRunner:
             for role, model_id in selection.roles.items():
                 self.settings.models[role].model = model_id
         self._active_operations = 0
+        self._coordinator_active: set[str] = set()
         self.store = run_store or RunStore(PROJECT_ROOT / "runs")
         self.context_pipeline = ContextPipeline(
             PROJECT_ROOT / "data" / "context",
@@ -320,20 +339,71 @@ class SwarmRunner:
         run_id: str,
         *,
         project_id: str | None = None,
+        _reservation: _CoordinatorTurn | None = None,
     ) -> AgentTurn:
-        if project_id == "global":
-            raise ValueError("global is reserved for operator-published workflow notes")
-        self._active_operations += 1
+        reservation = _reservation or self.reserve_tool_turn(
+            messages, run_id, project_id=project_id
+        )
+        if (
+            reservation.runner is not self or reservation.closed or reservation.claimed
+            or reservation.completion_id != run_id or reservation.project_id != project_id
+        ):
+            raise ValueError("Invalid or already claimed coordinator reservation")
+        reservation.claimed = True
         completed = None
         try:
             await self._pause_sleep()
+            turn = await self._admitted_tool_turn(
+                messages, tools, run_id, reservation.logical_id, project_id=project_id
+            )
+            if not turn.tool_calls and turn.finish_reason == "stop":
+                completed = self._sleep_completion(reservation.logical_id, project_id, {})
+            return turn
+        finally:
+            reservation.close()
+            self._finish_sleep(completed)
+
+    def reserve_tool_turn(
+        self, messages: list[dict[str, Any]], run_id: str, *, project_id: str | None = None
+    ) -> _CoordinatorTurn:
+        """Atomically claim admission before any await or HTTP response headers."""
+        if project_id == "global":
+            raise ValueError("global is reserved for operator-published workflow notes")
+        logical_id = self.coordinator_run_id(messages, run_id, project_id=project_id)
+        if len(logical_id) > 29:
+            raise ValueError("Coordinator run IDs must not exceed 29 characters")
+        if logical_id in self._coordinator_active:
+            raise ValueError("A continuation for this task is already active")
+        self._coordinator_active.add(logical_id)
+        self._active_operations += 1
+        return _CoordinatorTurn(self, logical_id, run_id, project_id)
+
+    async def _admitted_tool_turn(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        run_id: str, logical_id: str, *, project_id: str | None = None,
+    ) -> AgentTurn:
+        owns_run = logical_id != run_id
+        try:
             # Each outstanding external tool batch owns a durable foreground lease.
             # Consuming tool results transfers its hold to this active HTTP request.
+            if logical_id == run_id:
+                _, request = current_task(messages)
+                self.store.create_run(request or "(tool round)", logical_id)
+                owns_run = True
+                self.store.record_event(
+                    logical_id, "coordinator", "running", {"project_id": project_id}
+                )
+            node = self.store.get_run(logical_id).get("nodes", {}).get("coordinator", {})
+            owned = set(node.get("pending_tool_calls", []))
             received = {
                 str(message.get("tool_call_id"))
                 for message in messages
                 if message.get("role") == "tool" and message.get("tool_call_id")
-            }
+            } & owned
+            if owned:
+                self.store.record_event(
+                    logical_id, "coordinator", "running", {"pending_tool_calls": []}
+                )
             old_count = len(self._tool_leases)
             self._tool_leases.difference_update(received)
             if len(self._tool_leases) != old_count:
@@ -342,20 +412,31 @@ class SwarmRunner:
                     if stored and not self._lease_recovery_hold:
                         self._finish_sleep(None)
             if project_id is None:
-                turn = await self._respond_with_tools(messages, tools, run_id)
+                turn = await self._respond_with_tools(messages, tools, logical_id)
             else:
                 turn = await self._respond_with_tools(
-                    messages, tools, run_id, project_id=project_id
+                    messages, tools, logical_id, project_id=project_id
                 )
             if turn.tool_calls:
                 # Issue server-unique IDs: providers may reuse the same tool ID in
                 # independent conversations. Hermes echoes these IDs unchanged.
                 turn = AgentTurn(
                     turn.content,
-                    [{**call, "id": f"call_roi_{uuid.uuid4().hex}"} for call in turn.tool_calls],
+                    [
+                        {**call, "id": f"call_roi_{logical_id}__{uuid.uuid4().hex[:24]}"}
+                        for call in turn.tool_calls
+                    ],
                     turn.finish_reason,
                 )
                 added = {str(call["id"]) for call in turn.tool_calls}
+                issued = set(node.get("issued_tool_calls", [])) | owned
+                self.store.record_event(
+                    logical_id, "coordinator", "tool",
+                    {
+                        "pending_tool_calls": sorted(added),
+                        "issued_tool_calls": sorted(issued | added),
+                    },
+                )
                 for _ in added:
                     await self._pause_sleep()
                 self._tool_leases.update(added)
@@ -363,12 +444,56 @@ class SwarmRunner:
                     # Never hand tools to Hermes without a durable pause record:
                     # after restart an old valid lease file would look idle.
                     raise OSError("Tool lease storage unavailable")
-            if turn.finish_reason == "stop":
-                completed = self._sleep_completion(run_id, project_id, {})
+            elif turn.finish_reason == "stop":
+                self.store.complete_run(logical_id, turn.content)
+            else:
+                self.store.fail_run(logical_id, f"Incomplete response: {turn.finish_reason}")
             return turn
-        finally:
-            self._active_operations -= 1
-            self._finish_sleep(completed)
+        except BaseException as exc:
+            if owns_run:
+                self.store.fail_run(logical_id, f"{type(exc).__name__}: {exc}")
+            raise
+
+    def coordinator_run_id(
+        self, messages: list[dict[str, Any]], fallback: str, *, project_id: str | None = None
+    ) -> str:
+        """Recover the logical task from a tool ID we durably issued, including after restart."""
+        last_user, _ = current_task(messages)
+        candidates = []
+        received = set()
+        for message in messages[last_user + 1 :]:
+            if message.get("role") == "tool":
+                received.add(message.get("tool_call_id"))
+                candidates.append(message.get("tool_call_id"))
+            elif message.get("role") == "assistant":
+                candidates.extend(call.get("id") for call in message.get("tool_calls") or [])
+        for tool_id in reversed(candidates):
+            if not isinstance(tool_id, str):
+                continue
+            if not tool_id.startswith("call_roi_") or "__" not in tool_id:
+                continue
+            candidate = tool_id[len("call_roi_") :].rsplit("__", 1)[0]
+            try:
+                record = self.store.get_run(candidate)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise  # Corrupt durable ownership must not become a fresh task.
+            except (KeyError, ValueError):
+                continue
+            node = record.get("nodes", {}).get("coordinator", {})
+            issued = set(node.get("issued_tool_calls", [])) | set(
+                node.get("pending_tool_calls", [])
+            )
+            if tool_id in issued:
+                if node.get("project_id") != project_id:
+                    raise ValueError("Tool continuation has a different project scope")
+                if candidate in self._coordinator_active:
+                    raise ValueError("A continuation for this task is already active")
+                if record["status"] != "running" or not node.get("pending_tool_calls"):
+                    raise ValueError("This task or tool batch is finished; continuation is stale")
+                if not set(node["pending_tool_calls"]).issubset(received):
+                    raise ValueError("All outstanding tool results are required before continuing")
+                return candidate
+        return fallback
 
     async def _respond_with_tools(
         self,
@@ -379,24 +504,15 @@ class SwarmRunner:
         project_id: str | None = None,
     ) -> AgentTurn:
         """Hermes-tools mode: Opus coordinates with Hermes' tools plus delegate_to_swarm."""
-        request = next(
-            (
-                str(m.get("content") or "")
-                for m in reversed(messages)
-                if m.get("role") == "user" and isinstance(m.get("content"), str)
-            ),
-            "",
+        completion_id = f"{run_id}-r{uuid.uuid4().hex[:12]}"
+        current_index, _ = current_task(messages)
+        self.store.record_event(
+            run_id, "coordinator", "running", {"tools": len(tools or []), "project_id": project_id}
         )
-        self.store.create_run(request or "(tool round)", run_id)
-        self.store.record_event(run_id, "coordinator", "running", {"tools": len(tools or [])})
 
         async def run_swarm(swarm_request: str, swarm_run_id: str) -> str:
             self.store.record_event(run_id, "coordinator", "delegated", {"run": swarm_run_id})
             # Preserve original gathered evidence, not only the coordinator's retyped summary.
-            current_index = next(
-                (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
-                0,
-            )
             history = [
                 m
                 for i, m in enumerate(messages)
@@ -422,15 +538,16 @@ class SwarmRunner:
             token_encoding=self.settings.context.token_encoding,
         )
         try:
-            turn = await agent.respond(messages, tools, run_id=run_id)
+            turn = await agent.respond(messages, tools, run_id=completion_id)
         except BaseException as exc:
             self.store.record_event(run_id, "coordinator", "failed", {"error": type(exc).__name__})
             self.store.fail_run(run_id, f"{type(exc).__name__}: {exc}")
             raise
         names = [call["function"]["name"] for call in turn.tool_calls]
-        self.store.record_event(run_id, "coordinator", "completed", {"tool_calls": names})
-        summary = turn.content or ("Вызов инструментов Hermes: " + ", ".join(names))
-        self.store.complete_run(run_id, summary)
+        status = "tool" if turn.tool_calls else (
+            "completed" if turn.finish_reason == "stop" else "failed"
+        )
+        self.store.record_event(run_id, "coordinator", status, {"tool_calls": names})
         return turn
 
     async def should_use_waves(
@@ -442,17 +559,13 @@ class SwarmRunner:
         names = {tool.get("function", {}).get("name") for tool in tools or []}
         if not names & WORK_TOOLS:
             return False  # Hermes auxiliary jobs (titles, skill review)
-        last_user = next(
-            (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
-            None,
-        )
-        if last_user is None or last_user != len(messages) - 1:
+        last_user, request = current_task(messages)
+        if not request or last_user < 0 or any(
+            not is_runtime_notice(message) for message in messages[last_user + 1 :]
+        ):
             return False  # a coordinator tool round is in progress: finish it there
         if not self._hermes_workers_available():
             return False  # no Hermes checkout on this server: stay on the coordinator path
-        request = str(messages[last_user].get("content") or "").strip()
-        if not request or not isinstance(messages[last_user].get("content"), str):
-            return False
         try:
             return await self._assess_for_swarm(request)
         except Exception:
@@ -475,7 +588,7 @@ class SwarmRunner:
         if project_id == "global":
             raise ValueError("global is reserved for operator-published workflow notes")
         config = self.settings.hermes_workers
-        request = str(messages[-1].get("content") or "")
+        _, request = current_task(messages)
         self._active_operations += 1
         completed = None
         created = False

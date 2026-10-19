@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from roi_swarm.conversation import current_task
 from roi_swarm.token_budget import check_context
 
 DELEGATE_TOOL_NAME = "delegate_to_swarm"
@@ -124,10 +125,8 @@ def _text(content: Any) -> str:
 
 def _current_turn(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """Last user request and every message Hermes appended after it (tool rounds)."""
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            return _text(messages[index].get("content")).strip(), messages[index + 1 :]
-    return "", []
+    index, request = current_task(messages)
+    return request, messages[index + 1 :] if index >= 0 else []
 
 
 def _auto_delegate_call(request: str, turn_messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -213,8 +212,11 @@ class HermesToolAgent:
                     encoding=self.token_encoding,
                 )
                 response = await self.client.chat.completions.create(**kwargs)
+                finish_reason = response.choices[0].finish_reason
                 message = response.choices[0].message
                 content = (message.content or "").strip()
+                if finish_reason not in {"stop", "tool_calls"}:
+                    return AgentTurn(content, [], finish_reason or "length")
                 calls = [_call_dict(call) for call in (message.tool_calls or [])]
                 delegated = [c for c in calls if c["function"]["name"] == DELEGATE_TOOL_NAME]
                 external = [c for c in calls if c["function"]["name"] != DELEGATE_TOOL_NAME]

@@ -1576,6 +1576,7 @@ name = "roi-swarm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastapi" },
     { name = "langgraph" },
     { name = "openai" },
@@ -1605,6 +1606,7 @@ embeddings = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "huggingface-hub", marker = "extra == 'embeddings'", specifier = ">=1.0.0" },
     { name = "langgraph", specifier = ">=1.0.0" },

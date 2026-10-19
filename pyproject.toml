@@ -5,6 +5,7 @@ description = "Adaptive LangGraph swarm with configurable OpenAI-compatible mode
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "anyio>=4.0.0",
   "fastapi>=0.115.0",
   "tiktoken>=0.9.0",
   "uvicorn[standard]>=0.34.0",

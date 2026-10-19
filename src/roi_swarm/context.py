@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from roi_swarm.artifacts import ArtifactRef, ArtifactStore
+from roi_swarm.conversation import task_text
 from roi_swarm.schemas import PlannedTask
 from roi_swarm.token_budget import check_context, count_tokens
 
@@ -421,13 +422,13 @@ class ContextPipeline:
 
     @staticmethod
     def goal_from_request(text: str) -> str:
-        return text.partition("\n\nMATERIALS:\n")[0].strip()
+        return task_text(text).partition("\n\nMATERIALS:\n")[0].strip()
 
     @staticmethod
     def _current_request(conversation: NormalizedConversation) -> str:
         for block in reversed(conversation.blocks):
-            if block.role == "user" and block.text.strip():
-                return ContextPipeline.goal_from_request(block.text)
+            if block.role == "user" and (goal := ContextPipeline.goal_from_request(block.text)):
+                return goal
         return ""
 
     @staticmethod
@@ -459,7 +460,7 @@ class ContextPipeline:
             ContextPipeline.goal_from_request(block.text)
             for block in conversation.blocks
             if block.role == "user"
-            and block.text.strip()
+            and ContextPipeline.goal_from_request(block.text)
             and ContextPipeline.goal_from_request(block.text) != current_request
         ]
         return CanonicalState(

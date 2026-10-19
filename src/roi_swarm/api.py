@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import time
@@ -9,10 +10,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from roi_swarm.conversation import current_task
 from roi_swarm.experience import WorkflowLesson
 from roi_swarm.model_settings import ModelSelection
 from roi_swarm.runner import SwarmRunner
@@ -20,6 +23,41 @@ from roi_swarm.security import require_provider_auth
 
 STATIC_DIR = Path(__file__).parent / "static"
 PROGRESS_POLL_SECONDS = 5.0
+
+
+async def _settle_stream_task(task: asyncio.Task) -> None:
+    """Drain cleanup through AnyIO level cancellation and repeated asyncio cancellation."""
+    cancelled = False
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    cancelled = True
+        with contextlib.suppress(asyncio.CancelledError):
+            task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+class _ReservedToolResponse(StreamingResponse):
+    """Release admission even if sending headers fails before iteration starts."""
+
+    def __init__(self, *args, reservation=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reservation = reservation
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await _settle_stream_task(asyncio.create_task(self.body_iterator.aclose()))
+            finally:
+                if self.reservation is not None:
+                    self.reservation.close()
+
 
 _NODE_LABELS = {
     "context": "Контекст подготовлен",
@@ -111,6 +149,17 @@ def _progress_lines(store: Any, run_id: str, seen: int) -> tuple[list[str], int]
 def _family_progress(store: Any, run_id: str, seen: dict[str, int]) -> list[str]:
     """Progress of a run plus the swarm runs it delegated (``<run_id>-s1``, ``-s2``...)."""
     lines, seen[run_id] = _progress_lines(store, run_id, seen.get(run_id, 0))
+    children = set()
+    if store is not None:
+        try:
+            events = store.get_run(run_id).get("events", [])
+        except (KeyError, ValueError, OSError):
+            events = []
+        children.update(
+            event["data"]["run"] for event in events
+            if event.get("node") == "coordinator" and event.get("status") == "delegated"
+            and isinstance(event.get("data", {}).get("run"), str)
+        )
     index = 1
     while True:
         child = f"{run_id}-s{index}"
@@ -119,7 +168,11 @@ def _family_progress(store: Any, run_id: str, seen: dict[str, int]) -> list[str]
             break
         seen[child] = count
         lines.extend(child_lines)
+        children.discard(child)
         index += 1
+    for child in sorted(children):
+        child_lines, seen[child] = _progress_lines(store, child, seen.get(child, 0))
+        lines.extend(child_lines)
     return lines
 
 
@@ -278,6 +331,10 @@ def create_app(runner: RunnerProtocol | None = None) -> FastAPI:
         scope = {"project_id": request.project_id} if request.project_id else {}
         if request.tools and hasattr(swarm, "respond_with_tools"):
             forwarded = _forward_messages(request.messages)
+            resolve = getattr(swarm, "coordinator_run_id", None)
+            if resolve is not None:
+                # Validate a complete tool batch before opening an SSE response.
+                resolve(forwarded, completion_id, **scope)
             waves = hasattr(swarm, "run_waves") and await swarm.should_use_waves(
                 forwarded, request.tools
             )
@@ -304,8 +361,14 @@ def create_app(runner: RunnerProtocol | None = None) -> FastAPI:
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 }
             if request.stream:
-                return StreamingResponse(
-                    _stream_tool_turn(swarm, completion_id, forwarded, request.tools, **scope),
+                reserve = getattr(swarm, "reserve_tool_turn", None)
+                reservation = reserve(forwarded, completion_id, **scope) if reserve else None
+                return _ReservedToolResponse(
+                    _stream_tool_turn(
+                        swarm, completion_id, forwarded, request.tools,
+                        reservation=reservation, **scope,
+                    ),
+                    reservation=reservation,
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -632,20 +695,29 @@ async def _stream_tool_turn(
     tools: list[dict[str, Any]],
     *,
     project_id: str | None = None,
+    reservation: Any = None,
 ):
     created = int(time.time())
-    yield _chunk(completion_id, created, {"role": "assistant", "content": ""})
     scope = {"project_id": project_id} if project_id else {}
-    task = asyncio.create_task(swarm.respond_with_tools(messages, tools, completion_id, **scope))
+    resolve = getattr(swarm, "coordinator_run_id", None)
+    logical_id = reservation.logical_id if reservation is not None else (
+        resolve(messages, completion_id, **scope) if resolve is not None else completion_id
+    )
+    task = None
     store = getattr(swarm, "store", None)
     seen: dict[str, int] = {}
     try:
+        yield _chunk(completion_id, created, {"role": "assistant", "content": ""})
+        kwargs = {**scope, "_reservation": reservation} if reservation is not None else scope
+        task = asyncio.create_task(
+            swarm.respond_with_tools(messages, tools, completion_id, **kwargs)
+        )
         while True:
             try:
                 turn = await asyncio.wait_for(asyncio.shield(task), timeout=PROGRESS_POLL_SECONDS)
                 break
             except TimeoutError:
-                lines = _family_progress(store, completion_id, seen)
+                lines = _family_progress(store, logical_id, seen)
                 text = "".join(f"{line}\n" for line in lines) or "·"
                 yield _reasoning_chunk(completion_id, created, text)
     except Exception as exc:
@@ -654,8 +726,9 @@ async def _stream_tool_turn(
         yield "data: [DONE]\n\n"
         return
     finally:
-        if not task.done():  # client disconnected mid-wait: don't keep paying for the turn
+        if task is not None and not task.done():
             task.cancel()
+            await _settle_stream_task(task)
     if turn.content:
         yield _chunk(completion_id, created, {"content": turn.content})
     for index, call in enumerate(turn.tool_calls):
@@ -722,20 +795,7 @@ def _stream_chat_completion(
 
 
 def _last_user_text(messages: list[ChatMessage]) -> str:
-    for message in reversed(messages):
-        if message.role != "user":
-            continue
-        if isinstance(message.content, str):
-            return message.content.strip()
-        if message.content is None:
-            continue
-        parts = [
-            str(item.get("text", ""))
-            for item in message.content
-            if item.get("type") in {"text", "input_text"}
-        ]
-        return "\n".join(part for part in parts if part).strip()
-    return ""
+    return current_task(_forward_messages(messages))[1]
 
 
 app = create_app()
